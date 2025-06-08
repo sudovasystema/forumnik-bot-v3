@@ -2653,6 +2653,31 @@ async def number_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Произошла внутренняя ошибка сервера.")
 # --- Конец /number ---
 
+# --- Новая команда для предложений ---
+async def init_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Отправляет информационное сообщение со ссылкой на бота для предложений.
+    Доступно всем авторизованным судьям.
+    """
+    conn = context.bot_data['db_connection']
+    
+    # Проверяем, что команду вызывает авторизованный судья
+    can_proceed, user_nick_name, is_admin = await perform_wa_check(conn, tg_user_id=update.effective_user.id, update=update)
+    if not can_proceed:
+        return
+
+    logger.info(f"Пользователь {user_nick_name} вызвал команду /init.")
+
+    # Формируем и отправляем статичное сообщение
+    message_text = (
+        "👀 Я смотрю, у тебя появилась идея, как можно улучшить наш функционал?\n\n"
+        "Напиши боту свою идею, и я обязательно постараюсь воплотить её в жизнь! 💡\n\n"
+        "✍️ **Бот для идей -> @court_init_bot**"
+    )
+    
+    await update.message.reply_text(message_text, disable_web_page_preview=True)
+# --- Конец ---
+
 # --- Другие обработчики команд ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -2749,6 +2774,7 @@ def main() -> None:
     application.add_handler(CommandHandler("adm", admin_modify_command))
     application.add_handler(CommandHandler("number", number_command))
     application.add_handler(CommandHandler("caselog", case_log_command))
+    application.add_handler(CommandHandler("init", init_command))
 
     # Добавление тестовых команд
     application.add_handler(CommandHandler("testlog", test_login_command))
