@@ -2672,7 +2672,7 @@ async def init_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message_text = (
         "👀 Я смотрю, у тебя появилась идея, как можно улучшить наш функционал?\n\n"
         "Напиши боту свою идею, и я обязательно постараюсь воплотить её в жизнь! 💡\n\n"
-        "✍️ **Бот для идей -> @court_init_bot**"
+        "✍️ **Бот для идей -> @forumnik_suggestion_bot**"
     )
     
     await update.message.reply_text(message_text, disable_web_page_preview=True)
