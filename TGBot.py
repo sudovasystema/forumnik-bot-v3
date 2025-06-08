@@ -75,7 +75,7 @@ selenium_driver = None
 selenium_service = None
 
 # Состояния для ConversationHandler
-ASK_NICKNAME, ASK_PASSWORD, AWAITING_CUSTOM_REPLY = range(3)
+ASK_NICKNAME, ASK_PASSWORD, AWAITING_CUSTOM_REPLY, AWAITING_DOP_OFFICER_NAME = range(4)
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -1285,7 +1285,6 @@ async def handle_refutation_workflow(update: Update, context: ContextTypes.DEFAU
         cursor = conn.cursor()
         
         cursor.execute(f"UPDATE {CASES_TABLE_NAME} SET status = 'f' WHERE id = ?", (case_id,))
-        add_note_to_case(conn, case_id, f"Запрошено опровержение судьей (никнейм будет здесь).") # Нужно будет передать ник
         
         cursor.execute(f"SELECT applicant_name, case_num, topic_link, officer_name FROM {CASES_TABLE_NAME} WHERE id = ?", (case_id,))
         case_data_db = cursor.fetchone()
@@ -1295,6 +1294,7 @@ async def handle_refutation_workflow(update: Update, context: ContextTypes.DEFAU
 
         cursor.execute(f"SELECT marker_desc FROM {HELPER_TABLE_NAME} WHERE marker = ?", (template_marker,))
         template_text = cursor.fetchone()[0]
+        add_note_to_case(conn, case_id, f"Запрошено опровержение судьей {judge_nick_name}.")
         
         conn.commit()
         await check_and_increment_case_number(conn, case_id)
@@ -1357,29 +1357,144 @@ async def handle_refutation_workflow(update: Update, context: ContextTypes.DEFAU
 
 # --- Начало handle_rebuttal_choice ---
 async def handle_rebuttal_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, case_id: int, rebuttal_type: str):
+    """
+    Обрабатывает выбор типа опровержения. 
+    Умеет работать как в основном воркфлоу, так и в /dop.
+    """
     query = update.callback_query
-    await query.edit_message_text(text=f"✅ Выбор принят: '{rebuttal_type}'.\n\nСобираю данные и запускаю обработчик...")
+    conn = context.bot_data['db_connection']
+    
+    officer_name_to_use = None
+    
+    # Проверяем, есть ли в user_data данные от команды /dop
+    if context.user_data.get('dop_case_id') == case_id:
+        officer_name_to_use = context.user_data.get('dop_officer_name')
+        # Очищаем временные данные
+        context.user_data.pop('dop_case_id', None)
+        context.user_data.pop('dop_officer_name', None)
+    
+    if not officer_name_to_use:
+        # Если это не /dop, берем имя из базы
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT officer_name FROM {CASES_TABLE_NAME} WHERE id = ?", (case_id,))
+        result = cursor.fetchone()
+        if not result:
+            await query.edit_message_text("❌ Ошибка: не удалось найти офицера для этого иска.")
+            return
+        officer_name_to_use = result[0]
+    
+    # Вызываем нашу "ядерную" функцию с правильным именем офицера
+    await execute_yarnabi_request(query, context, case_id, rebuttal_type, officer_name_to_use)
+# --- Конец handle_rebuttal_choice ---
+
+# --- Начало функций для диалога /dop ---
+async def dop_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Начинает диалог для дополнительного запроса опровержения."""
+    conn = context.bot_data['db_connection']
+    
+    # Проверка прав и статуса
+    can_proceed, _, _ = await perform_wa_check(conn, update.effective_user.id, update)
+    if not can_proceed:
+        return ConversationHandler.END
+
+    if not context.args:
+        await update.message.reply_text("Пожалуйста, укажите ID иска. Пример: /dop 123")
+        return ConversationHandler.END
+        
+    try:
+        case_id = int(context.args[0])
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT status FROM {CASES_TABLE_NAME} WHERE id = ?", (case_id,))
+        result = cursor.fetchone()
+        
+        if not result:
+            await update.message.reply_text(f"Иск с ID {case_id} не найден.")
+            return ConversationHandler.END
+        
+        if result[0] != 'f':
+            await update.message.reply_text("Эту команду можно использовать только для исков в статусе 'Запрос опровержения' (f).")
+            return ConversationHandler.END
+
+    except (ValueError, IndexError):
+        await update.message.reply_text("Неверный формат ID иска.")
+        return ConversationHandler.END
+
+    # Если все проверки пройдены
+    context.user_data['dop_case_id'] = case_id
+    await update.message.reply_text(
+        f"Выполняю дополнительный запрос для иска #{case_id}.\n"
+        "Пожалуйста, введите **никнейм нового офицера**, к которому нужно направить запрос."
+    )
+    return AWAITING_DOP_OFFICER_NAME
+
+async def dop_received_officer_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Получает ник офицера и показывает клавиатуру выбора типа опровержения."""
+    new_officer_name = update.message.text
+    case_id = context.user_data.get('dop_case_id')
+    judge_tg_user_id = update.effective_user.id
+
+    if not case_id:
+        await update.message.reply_text("Произошла ошибка, ID иска не найден. Начните заново.")
+        return ConversationHandler.END
+    
 
     conn = context.bot_data['db_connection']
-    logger.info(f"Для иска #{case_id} выбран тип опровержения: '{rebuttal_type}'. Запускаю внешний скрипт.")
+    cursor = conn.cursor()
+
+    # Получаем ник судьи, который инициировал действие, для лога
+    cursor.execute(f"SELECT nick_name FROM {USERS_TABLE_NAME} WHERE tg_user_id = ?", (judge_tg_user_id,))
+    judge_nick_name_result = cursor.fetchone()
+    judge_nick_name = judge_nick_name_result[0] if judge_nick_name_result else "Неизвестный судья"
+
+    # Добавляем запись в лог
+    log_message = f"Отправлен дополнительный запрос офицеру '{new_officer_name}' (инициатор: {judge_nick_name})."
+    add_note_to_case(conn, case_id, log_message)
+    
+        
+    # Сохраняем нового офицера во временные данные
+    context.user_data['dop_officer_name'] = new_officer_name
+    
+    # Показываем ту же клавиатуру, что и в основном воркфлоу
+    rebuttal_keyboard = [
+            [InlineKeyboardButton("🚓 Розыск", callback_data=f"rebuttal_choice:Розыск:{case_id}"), 
+             InlineKeyboardButton("⛓️ Арест", callback_data=f"rebuttal_choice:Арест:{case_id}")],
+            [InlineKeyboardButton("🅿️ Штрафстоянка", callback_data=f"rebuttal_choice:Штрафстоянка:{case_id}"), 
+             InlineKeyboardButton("🧾 Штраф", callback_data=f"rebuttal_choice:Штраф:{case_id}")],
+            [InlineKeyboardButton("⏳ Срок", callback_data=f"rebuttal_choice:Срок:{case_id}"), 
+             InlineKeyboardButton("🧱 Карцер", callback_data=f"rebuttal_choice:Картцер:{case_id}")]
+        ]
+    reply_markup = InlineKeyboardMarkup(rebuttal_keyboard)
+    
+    await update.message.reply_text(
+        f"Отлично. Теперь выберите тип запроса для офицера **{new_officer_name}**:",
+        reply_markup=reply_markup
+    )
+    
+    return ConversationHandler.END # Завершаем диалог, дальнейшее - через кнопки
+# --- конец функций я ДОП ---
+
+# --- Ядерная функция вызова ярнаби ---
+async def execute_yarnabi_request(query: Update.callback_query, context: ContextTypes.DEFAULT_TYPE, case_id: int, rebuttal_type: str, officer_name: str):
+    """
+    "Ядерная" функция: собирает данные и запускает yarnabi_handler.py.
+    """
+    await query.edit_message_text(text=f"✅ Выбор принят: '{rebuttal_type}' для офицера {officer_name}.\n\nСобираю данные и запускаю обработчик...")
+
+    conn = context.bot_data['db_connection']
+    judge_tg_user_id = query.from_user.id
+    logger.info(f"Для иска #{case_id} запускается yarnabi_handler для офицера '{officer_name}' с типом '{rebuttal_type}'.")
 
     try:
-        # 1. Сбор данных (как и раньше)
+        # 1. Сбор данных
         cursor = conn.cursor()
-        cursor.execute(
-            f"SELECT topic_link, officer_name, current_judge FROM {CASES_TABLE_NAME} WHERE id = ?",
-            (case_id,)
-        )
+        cursor.execute(f"SELECT topic_link, current_judge FROM {CASES_TABLE_NAME} WHERE id = ?", (case_id,))
         db_result = cursor.fetchone()
-        topic_link, officer_name, current_judge = db_result
+        topic_link, current_judge = db_result
 
-        cursor.execute(
-            f"SELECT yarn_judge FROM {USERS_TABLE_NAME} WHERE tg_user_id = ?",
-            (query.from_user.id,)
-        )
+        cursor.execute(f"SELECT yarn_judge FROM {USERS_TABLE_NAME} WHERE tg_user_id = ?", (judge_tg_user_id,))
         yarn_judge_value = cursor.fetchone()[0] or "не_установлено"
 
-        # 2. Подготовка и запуск субпроцесса (как и раньше)
+        # 2. Подготовка и запуск субпроцесса
         command_args = [
             'python', 'yarnabi_handler.py', str(topic_link), str(officer_name),
             str(current_judge), str(rebuttal_type), str(yarn_judge_value)
@@ -1388,55 +1503,30 @@ async def handle_rebuttal_choice(update: Update, context: ContextTypes.DEFAULT_T
         logger.info(f"Запускаю субпроцесс: {command_args}")
         await query.edit_message_text(text="⚙️ Запустил обработчик... Ожидаю ответа...")
 
-        process_result = subprocess.run(
-            command_args, capture_output=True, text=True, check=False, encoding='utf-8'
-        )
+        process_result = subprocess.run(command_args, capture_output=True, text=True, check=False, encoding='utf-8')
 
-        # 3. ОБНОВЛЕННАЯ ОБРАБОТКА РЕЗУЛЬТАТА
+        # 3. Обработка результата (парсинг JSON)
         if process_result.returncode == 0:
-            # Скрипт завершился без системных ошибок, теперь парсим его JSON-ответ
             try:
                 json_output = json.loads(process_result.stdout)
-                
-                # Проверяем внутренний статус код из JSON
                 if json_output.get("status_code") == 200:
-                    # ПОЛНЫЙ УСПЕХ
                     success_message = json_output.get("message", "Получен пустой успешный ответ.")
-                    logger.info(f"Скрипт yarnabi_handler.py успешно выполнен для иска #{case_id}.")
-                    response_text = (
-                        f"✅ Запрос опровержения '{rebuttal_type}' для иска #{case_id} успешно выполнен.\n\n"
-                        f"<b>Ответ обработчика:</b>\n{success_message}"
-                    )
+                    response_text = f"✅ Запрос успешно выполнен.\n\n<b>Ответ обработчика:</b>\n{success_message}"
                     await query.edit_message_text(text=response_text, parse_mode='HTML')
                 else:
-                    # Ошибка на уровне приложения (status_code не 200)
                     error_message = json_output.get("message", "Обработчик вернул ошибку без описания.")
-                    logger.error(f"Скрипт yarnabi_handler.py вернул ошибку приложения: {error_message}")
-                    response_text = (
-                        f"❌ Обработчик вернул ошибку для запроса '{rebuttal_type}' (иск #{case_id}):\n\n"
-                        f"<pre>{error_message}</pre>"
-                    )
+                    response_text = f"❌ Обработчик вернул ошибку:\n\n<pre>{error_message}</pre>"
                     await query.edit_message_text(text=response_text, parse_mode='HTML')
-
-            except (json.JSONDecodeError, KeyError) as e:
-                # Ошибка, если вывод скрипта - невалидный JSON или в нем нет нужных ключей
-                logger.error(f"Не удалось разобрать JSON-ответ от yarnabi_handler.py: {e}")
-                logger.error(f"Полученный вывод: {process_result.stdout}")
-                await query.edit_message_text(text="❌ Получен некорректный ответ от обработчика. Обратитесь к администратору.")
-        
+            except (json.JSONDecodeError, KeyError):
+                await query.edit_message_text(text="❌ Получен некорректный ответ от обработчика.")
         else:
-            # Ошибка на уровне системы (скрипт "упал")
-            logger.error(f"Скрипт yarnabi_handler.py вернул системную ошибку для иска #{case_id}. stderr: {process_result.stderr}")
-            response_text = (
-                f"❌ При выполнении запроса '{rebuttal_type}' для иска #{case_id} произошла системная ошибка.\n\n"
-                f"<b>Сообщение об ошибке:</b>\n<pre>{process_result.stderr}</pre>"
-            )
+            response_text = f"❌ Системная ошибка при выполнении запроса:\n\n<pre>{process_result.stderr}</pre>"
             await query.edit_message_text(text=response_text, parse_mode='HTML')
 
     except Exception as e:
-        logger.error(f"Критическая ошибка в воркфлоу handle_rebuttal_choice для иска #{case_id}: {e}", exc_info=True)
+        logger.error(f"Критическая ошибка в execute_yarnabi_request для иска #{case_id}: {e}", exc_info=True)
         await query.edit_message_text(text=f"❌ Произошла критическая ошибка в работе бота: {e}")
-# --- Конец handle_rebuttal_choice ---
+# --- Конец ядерной функции ---
 
 # --- Начало функций для диалога "Свой ответ" ---
 async def custom_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2749,6 +2839,15 @@ def main() -> None:
         # Позволяет другим хендлерам (например, /list) работать, пока бот в диалоге
         per_message=False 
     )
+    dop_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("dop", dop_start)],
+        states={
+            AWAITING_DOP_OFFICER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, dop_received_officer_name)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_custom_reply)], # Можно использовать ту же функцию отмены
+        per_message=False
+    )
+    application.add_handler(dop_conv_handler)
 
     regular_button_handler = CallbackQueryHandler(button_callback_router, pattern="^(?!custom_reply:.*)")
 
